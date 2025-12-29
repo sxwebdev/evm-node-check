@@ -29,4 +29,10 @@ go.work.sum
 
 # Editor/IDE
 # .idea/
-# .vscode/
+.vscode/
+.claude/
+
+# Config file
+config.yaml
+
+/evm-node-check
