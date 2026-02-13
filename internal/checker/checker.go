@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math/big"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
@@ -36,6 +37,7 @@ type NodeResult struct {
 	BlockNumber uint64
 	BlockHashes map[uint64]common.Hash
 	DebugOK     bool
+	Latency     time.Duration
 	Error       error
 }
 
@@ -217,8 +219,10 @@ func (c *Checker) checkNode(ctx context.Context, n config.NodeInfo) NodeResult {
 
 	ethClient := ethclient.NewClient(rpcClient)
 
-	// Get chain ID
+	// Get chain ID and measure latency
+	start := time.Now()
 	chainID, err := ethClient.ChainID(ctx)
+	info.Latency = time.Since(start)
 	if err != nil {
 		info.Error = fmt.Errorf("failed to get chain ID: %w", err)
 		return info

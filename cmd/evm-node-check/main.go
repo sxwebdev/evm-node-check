@@ -138,6 +138,7 @@ func printResults(logger *slog.Logger, result *checker.CheckResult) {
 					"chain", node.Chain,
 					"block_number", node.BlockNumber,
 					"debug_ok", node.DebugOK,
+					"latency", node.Latency,
 				)
 			}
 		}
