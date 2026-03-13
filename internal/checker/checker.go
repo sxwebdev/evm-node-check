@@ -18,6 +18,7 @@ import (
 type Options struct {
 	MaxBlockGap    uint64
 	BlockHashCount int
+	CheckTimeout   time.Duration
 	CheckDebugMode bool
 }
 
@@ -115,6 +116,9 @@ func (c *Checker) checkChain(ctx context.Context, chain string, nodes []config.N
 		wg.Add(1)
 		go func(idx int, n config.NodeInfo) {
 			defer wg.Done()
+
+			ctx, cancel := context.WithTimeout(ctx, c.opts.CheckTimeout)
+			defer cancel()
 
 			info := c.checkNode(ctx, n)
 

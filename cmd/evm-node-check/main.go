@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/sxwebdev/evm-node-check/internal/checker"
 	"github.com/sxwebdev/evm-node-check/internal/config"
@@ -32,6 +33,12 @@ func main() {
 				Name:    "block-hash-count",
 				Aliases: []string{"b"},
 				Usage:   "Number of recent blocks to compare hashes",
+				Value:   5,
+			},
+			&cli.IntFlag{
+				Name:    "timeout",
+				Aliases: []string{"t"},
+				Usage:   "Timeout in seconds for each node check",
 				Value:   5,
 			},
 			&cli.BoolFlag{
@@ -86,6 +93,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	opts := checker.Options{
 		MaxBlockGap:    uint64(cmd.Int("max-block-gap")),
 		BlockHashCount: int(cmd.Int("block-hash-count")),
+		CheckTimeout:   time.Duration(cmd.Int("timeout")) * time.Second,
 		CheckDebugMode: !cmd.Bool("skip-debug-check"),
 	}
 
