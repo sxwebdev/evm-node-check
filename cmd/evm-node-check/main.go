@@ -41,6 +41,16 @@ func main() {
 				Usage:   "Timeout in seconds for each node check",
 				Value:   5,
 			},
+			&cli.IntFlag{
+				Name:  "max-block-age",
+				Usage: "Maximum allowed age in seconds of the head block timestamp (0 to disable)",
+				Value: 120,
+			},
+			&cli.IntFlag{
+				Name:  "min-peer-count",
+				Usage: "Minimum allowed net_peerCount",
+				Value: 3,
+			},
 			&cli.BoolFlag{
 				Name:    "skip-debug-check",
 				Aliases: []string{"s"},
@@ -95,6 +105,8 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		BlockHashCount: int(cmd.Int("block-hash-count")),
 		CheckTimeout:   time.Duration(cmd.Int("timeout")) * time.Second,
 		CheckDebugMode: !cmd.Bool("skip-debug-check"),
+		MaxBlockAge:    time.Duration(cmd.Int("max-block-age")) * time.Second,
+		MinPeerCount:   uint64(cmd.Int("min-peer-count")),
 	}
 
 	// Run checker
@@ -117,13 +129,17 @@ func run(ctx context.Context, cmd *cli.Command) error {
 
 func printResults(logger *slog.Logger, result *checker.CheckResult) {
 	for _, chainResult := range result.ChainResults {
-		logger.Info("chain results",
+		chainAttrs := []any{
 			"chain", chainResult.Chain,
 			"chain_id", chainResult.ExpectedChainID,
 			"max_block_number", chainResult.MaxBlockNumber,
 			"total_nodes", len(chainResult.Nodes),
 			"failed_nodes", len(chainResult.FailedNodes),
-		)
+		}
+		if chainResult.CommonBlockNumber != 0 {
+			chainAttrs = append(chainAttrs, "common_block", chainResult.CommonBlockNumber)
+		}
+		logger.Info("chain results", chainAttrs...)
 
 		// Print successful nodes
 		for _, node := range chainResult.Nodes {
@@ -141,13 +157,30 @@ func printResults(logger *slog.Logger, result *checker.CheckResult) {
 			}
 
 			if !failed {
-				logger.Info("node OK",
+				nodeAttrs := []any{
 					"id", node.ID,
 					"chain", node.Chain,
 					"block_number", node.BlockNumber,
+					"syncing", node.Syncing,
 					"debug_ok", node.DebugOK,
 					"latency", node.Latency,
-				)
+				}
+				if node.PeerCountSupported {
+					nodeAttrs = append(nodeAttrs, "peer_count", node.PeerCount)
+				}
+				if node.HeadBlockTime > 0 {
+					nodeAttrs = append(nodeAttrs,
+						"head_block_age", time.Since(time.Unix(int64(node.HeadBlockTime), 0)).Truncate(time.Second),
+					)
+				}
+				if node.TxCounts != nil && node.TxCounts.Err == nil {
+					nodeAttrs = append(nodeAttrs,
+						"tx_count_eth", node.TxCounts.Eth,
+						"tx_count_receipts", node.TxCounts.Receipts,
+						"tx_count_debug", node.TxCounts.Debug,
+					)
+				}
+				logger.Info("node OK", nodeAttrs...)
 			}
 		}
 	}

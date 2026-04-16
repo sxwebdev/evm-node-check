@@ -3,16 +3,21 @@ package checker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/sxwebdev/evm-node-check/internal/config"
+	"golang.org/x/sync/errgroup"
 )
 
 type Options struct {
@@ -20,6 +25,8 @@ type Options struct {
 	BlockHashCount int
 	CheckTimeout   time.Duration
 	CheckDebugMode bool
+	MaxBlockAge    time.Duration
+	MinPeerCount   uint64
 }
 
 func DefaultOptions() Options {
@@ -27,28 +34,44 @@ func DefaultOptions() Options {
 		MaxBlockGap:    10,
 		BlockHashCount: 5,
 		CheckDebugMode: true,
+		MaxBlockAge:    2 * time.Minute,
+		MinPeerCount:   3,
 	}
 }
 
+type BlockTxCounts struct {
+	Block    uint64
+	Eth      int
+	Receipts int
+	Debug    int
+	Err      error
+}
+
 type NodeResult struct {
-	ID          string
-	Chain       string
-	Address     string
-	ChainID     *big.Int
-	BlockNumber uint64
-	BlockHashes map[uint64]common.Hash
-	DebugOK     bool
-	Latency     time.Duration
-	Error       error
+	ID                 string
+	Chain              string
+	Address            string
+	ChainID            *big.Int
+	BlockNumber        uint64
+	BlockHashes        map[uint64]common.Hash
+	HeadBlockTime      uint64
+	Syncing            bool
+	PeerCount          uint64
+	PeerCountSupported bool
+	DebugOK            bool
+	Latency            time.Duration
+	TxCounts           *BlockTxCounts
+	Error              error
 }
 
 type ChainResult struct {
-	Chain           string
-	Nodes           []NodeResult
-	ExpectedChainID *big.Int
-	MaxBlockNumber  uint64
-	FailedNodes     []FailedNode
-	Passed          bool
+	Chain             string
+	Nodes             []NodeResult
+	ExpectedChainID   *big.Int
+	MaxBlockNumber    uint64
+	CommonBlockNumber uint64
+	FailedNodes       []FailedNode
+	Passed            bool
 }
 
 type CheckResult struct {
@@ -182,6 +205,45 @@ func (c *Checker) checkChain(ctx context.Context, chain string, nodes []config.N
 			continue
 		}
 
+		// Check sync status
+		if node.Syncing {
+			result.FailedNodes = append(result.FailedNodes, FailedNode{
+				ID:      node.ID,
+				Chain:   node.Chain,
+				Address: node.Address,
+				Reason:  "node is still syncing (eth_syncing returned progress)",
+			})
+			result.Passed = false
+			continue
+		}
+
+		// Check peer count (skip if chain/node does not expose net_peerCount)
+		if node.PeerCountSupported && node.PeerCount < c.opts.MinPeerCount {
+			result.FailedNodes = append(result.FailedNodes, FailedNode{
+				ID:      node.ID,
+				Chain:   node.Chain,
+				Address: node.Address,
+				Reason:  fmt.Sprintf("peer count too low: %d (min required: %d)", node.PeerCount, c.opts.MinPeerCount),
+			})
+			result.Passed = false
+			continue
+		}
+
+		// Check head block freshness
+		if c.opts.MaxBlockAge > 0 && node.HeadBlockTime > 0 {
+			age := time.Since(time.Unix(int64(node.HeadBlockTime), 0))
+			if age > c.opts.MaxBlockAge {
+				result.FailedNodes = append(result.FailedNodes, FailedNode{
+					ID:      node.ID,
+					Chain:   node.Chain,
+					Address: node.Address,
+					Reason:  fmt.Sprintf("head block stale: age %s (max allowed: %s)", age.Truncate(time.Second), c.opts.MaxBlockAge),
+				})
+				result.Passed = false
+				continue
+			}
+		}
+
 		// Check debug mode
 		if c.opts.CheckDebugMode && !node.DebugOK {
 			result.FailedNodes = append(result.FailedNodes, FailedNode{
@@ -195,15 +257,19 @@ func (c *Checker) checkChain(ctx context.Context, chain string, nodes []config.N
 		}
 	}
 
+	// Check transaction count consistency on a common block
+	c.checkBlockTransactions(ctx, &result)
+
 	// Check block hashes consistency
 	c.checkBlockHashes(&result)
 
 	return result
 }
 
-// blockHeader is a minimal block header for getting hash
+// blockHeader is a minimal block header for getting hash and timestamp
 type blockHeader struct {
-	Hash common.Hash `json:"hash"`
+	Hash      common.Hash    `json:"hash"`
+	Timestamp hexutil.Uint64 `json:"timestamp"`
 }
 
 func (c *Checker) checkNode(ctx context.Context, n config.NodeInfo) NodeResult {
@@ -241,6 +307,45 @@ func (c *Checker) checkNode(ctx context.Context, n config.NodeInfo) NodeResult {
 	}
 	info.BlockNumber = blockNumber
 
+	// Check sync status. Some L2 clients (e.g. Arbitrum) return a non-nil
+	// progress object even when fully caught up, populated with their own
+	// non-standard fields. Only flag as syncing when CurrentBlock/HighestBlock
+	// show a meaningful lag beyond MaxBlockGap.
+	syncProgress, err := ethClient.SyncProgress(ctx)
+	if err != nil {
+		info.Error = fmt.Errorf("failed to get sync progress: %w", err)
+		return info
+	}
+	if syncProgress != nil &&
+		syncProgress.CurrentBlock > 0 &&
+		syncProgress.HighestBlock > syncProgress.CurrentBlock &&
+		syncProgress.HighestBlock-syncProgress.CurrentBlock > c.opts.MaxBlockGap {
+		info.Syncing = true
+	}
+
+	// Get peer count (not all chains implement net_peerCount; some always return 0)
+	var peerCountHex string
+	if err := rpcClient.CallContext(ctx, &peerCountHex, "net_peerCount"); err != nil {
+		var rerr rpc.Error
+		if !errors.As(err, &rerr) || rerr.ErrorCode() != -32601 {
+			info.Error = fmt.Errorf("failed to get peer count: %w", err)
+			return info
+		}
+		c.logger.Debug("net_peerCount not supported, skipping peer count check", "node", n.ID)
+	} else {
+		peerCount, err := strconv.ParseUint(strings.TrimPrefix(peerCountHex, "0x"), 16, 64)
+		if err != nil {
+			info.Error = fmt.Errorf("failed to parse peer count %q: %w", peerCountHex, err)
+			return info
+		}
+		info.PeerCount = peerCount
+		if peerCount > 0 {
+			info.PeerCountSupported = true
+		} else {
+			c.logger.Debug("net_peerCount returned 0, treating as unsupported", "node", n.ID)
+		}
+	}
+
 	// Get block hashes for last N blocks using raw RPC calls
 	for i := 0; i < c.opts.BlockHashCount; i++ {
 		if blockNumber < uint64(i) {
@@ -276,6 +381,9 @@ func (c *Checker) checkNode(ctx context.Context, n config.NodeInfo) NodeResult {
 		}
 
 		info.BlockHashes[targetBlock] = header.Hash
+		if i == 0 {
+			info.HeadBlockTime = uint64(header.Timestamp)
+		}
 	}
 
 	// Check debug mode
@@ -357,4 +465,221 @@ func (c *Checker) checkBlockHashes(result *ChainResult) {
 			}
 		}
 	}
+}
+
+func (c *Checker) checkBlockTransactions(ctx context.Context, result *ChainResult) {
+	failedAddrs := make(map[string]struct{}, len(result.FailedNodes))
+	for _, fn := range result.FailedNodes {
+		failedAddrs[fn.Address] = struct{}{}
+	}
+
+	passingIdx := make([]int, 0, len(result.Nodes))
+	var commonBlock uint64
+	for i, node := range result.Nodes {
+		if node.Error != nil {
+			continue
+		}
+		if _, ok := failedAddrs[node.Address]; ok {
+			continue
+		}
+		if len(passingIdx) == 0 || node.BlockNumber < commonBlock {
+			commonBlock = node.BlockNumber
+		}
+		passingIdx = append(passingIdx, i)
+	}
+
+	if len(passingIdx) == 0 {
+		return
+	}
+	if commonBlock == 0 {
+		c.logger.Warn("skipping tx count check: common block is 0", "chain", result.Chain)
+		return
+	}
+
+	result.CommonBlockNumber = commonBlock
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	for _, i := range passingIdx {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+
+			ctx, cancel := context.WithTimeout(ctx, c.opts.CheckTimeout)
+			defer cancel()
+
+			n := config.NodeInfo{
+				ID:      result.Nodes[idx].ID,
+				Chain:   result.Nodes[idx].Chain,
+				Address: result.Nodes[idx].Address,
+			}
+			counts := c.fetchBlockTxCounts(ctx, n, commonBlock)
+
+			mu.Lock()
+			result.Nodes[idx].TxCounts = counts
+			mu.Unlock()
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Per-node internal consistency check
+	for _, i := range passingIdx {
+		node := result.Nodes[i]
+		if node.TxCounts == nil {
+			continue
+		}
+		if node.TxCounts.Err != nil {
+			result.FailedNodes = append(result.FailedNodes, FailedNode{
+				ID:      node.ID,
+				Chain:   node.Chain,
+				Address: node.Address,
+				Reason:  fmt.Sprintf("failed to fetch tx counts at block %d: %v", commonBlock, node.TxCounts.Err),
+			})
+			result.Passed = false
+			failedAddrs[node.Address] = struct{}{}
+			continue
+		}
+		if node.TxCounts.Eth != node.TxCounts.Receipts || node.TxCounts.Eth != node.TxCounts.Debug {
+			result.FailedNodes = append(result.FailedNodes, FailedNode{
+				ID:      node.ID,
+				Chain:   node.Chain,
+				Address: node.Address,
+				Reason: fmt.Sprintf("transaction count mismatch at block %d: eth=%d, receipts=%d, debug=%d",
+					commonBlock, node.TxCounts.Eth, node.TxCounts.Receipts, node.TxCounts.Debug),
+			})
+			result.Passed = false
+			failedAddrs[node.Address] = struct{}{}
+		}
+	}
+
+	// Cross-node majority vote on canonical count
+	countNodes := make(map[int][]string)
+	for _, i := range passingIdx {
+		node := result.Nodes[i]
+		if node.TxCounts == nil || node.TxCounts.Err != nil {
+			continue
+		}
+		if _, ok := failedAddrs[node.Address]; ok {
+			continue
+		}
+		countNodes[node.TxCounts.Eth] = append(countNodes[node.TxCounts.Eth], node.ID)
+	}
+
+	if len(countNodes) <= 1 {
+		return
+	}
+
+	var majorityCount, maxLen int
+	for count, nodes := range countNodes {
+		if len(nodes) > maxLen {
+			maxLen = len(nodes)
+			majorityCount = count
+		}
+	}
+
+	for count, nodeIDs := range countNodes {
+		if count == majorityCount {
+			continue
+		}
+		for _, nodeID := range nodeIDs {
+			var nodeAddr, nodeChain string
+			for _, n := range result.Nodes {
+				if n.ID == nodeID {
+					nodeAddr = n.Address
+					nodeChain = n.Chain
+					break
+				}
+			}
+
+			result.FailedNodes = append(result.FailedNodes, FailedNode{
+				ID:      nodeID,
+				Chain:   nodeChain,
+				Address: nodeAddr,
+				Reason:  fmt.Sprintf("transaction count mismatch at block %d: got %d, majority %d", commonBlock, count, majorityCount),
+			})
+			result.Passed = false
+		}
+	}
+}
+
+func (c *Checker) fetchBlockTxCounts(ctx context.Context, n config.NodeInfo, block uint64) *BlockTxCounts {
+	out := &BlockTxCounts{Block: block}
+
+	rpcClient, err := rpc.DialContext(ctx, n.Address)
+	if err != nil {
+		out.Err = fmt.Errorf("failed to connect: %w", err)
+		return out
+	}
+	defer rpcClient.Close()
+
+	blockNumberHex := fmt.Sprintf("0x%x", block)
+
+	var ethCount, receiptsCount, debugCount int
+
+	g, gctx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		var raw json.RawMessage
+		if err := rpcClient.CallContext(gctx, &raw, "eth_getBlockByNumber", blockNumberHex, true); err != nil {
+			return fmt.Errorf("eth_getBlockByNumber: %w", err)
+		}
+		if len(raw) == 0 || string(raw) == "null" {
+			return fmt.Errorf("eth_getBlockByNumber: block %d not found", block)
+		}
+		var body struct {
+			Transactions []json.RawMessage `json:"transactions"`
+		}
+		if err := json.Unmarshal(raw, &body); err != nil {
+			return fmt.Errorf("eth_getBlockByNumber: unmarshal: %w", err)
+		}
+		ethCount = len(body.Transactions)
+		return nil
+	})
+
+	g.Go(func() error {
+		var raw json.RawMessage
+		if err := rpcClient.CallContext(gctx, &raw, "eth_getBlockReceipts", blockNumberHex); err != nil {
+			return fmt.Errorf("eth_getBlockReceipts: %w", err)
+		}
+		if len(raw) == 0 || string(raw) == "null" {
+			return fmt.Errorf("eth_getBlockReceipts: block %d not found", block)
+		}
+		var receipts []json.RawMessage
+		if err := json.Unmarshal(raw, &receipts); err != nil {
+			return fmt.Errorf("eth_getBlockReceipts: unmarshal: %w", err)
+		}
+		receiptsCount = len(receipts)
+		return nil
+	})
+
+	g.Go(func() error {
+		var raw json.RawMessage
+		err := rpcClient.CallContext(gctx, &raw, "debug_traceBlockByNumber", blockNumberHex, map[string]any{
+			"tracer": "callTracer",
+		})
+		if err != nil {
+			return fmt.Errorf("debug_traceBlockByNumber: %w", err)
+		}
+		if len(raw) == 0 || string(raw) == "null" {
+			return fmt.Errorf("debug_traceBlockByNumber: block %d not found", block)
+		}
+		var traces []json.RawMessage
+		if err := json.Unmarshal(raw, &traces); err != nil {
+			return fmt.Errorf("debug_traceBlockByNumber: unmarshal: %w", err)
+		}
+		debugCount = len(traces)
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		out.Err = err
+		return out
+	}
+
+	out.Eth = ethCount
+	out.Receipts = receiptsCount
+	out.Debug = debugCount
+	return out
 }
