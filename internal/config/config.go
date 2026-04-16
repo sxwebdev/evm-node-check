@@ -48,17 +48,32 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("no upstreams configured in config file")
 	}
 
-	// Check for duplicate addresses
-	seen := make(map[string]bool)
+	seenIDs := make(map[string]bool)
+	seenURLs := make(map[string]bool)
 	for _, upstream := range cfg.UpstreamConfig.Upstreams {
+		if upstream.ID == "" {
+			return nil, fmt.Errorf("upstream has empty id")
+		}
+		if seenIDs[upstream.ID] {
+			return nil, fmt.Errorf("duplicate upstream id: %s", upstream.ID)
+		}
+		seenIDs[upstream.ID] = true
+
+		if upstream.Chain == "" {
+			return nil, fmt.Errorf("upstream %s has empty chain", upstream.ID)
+		}
+		if len(upstream.Connectors) == 0 {
+			return nil, fmt.Errorf("upstream %s has no connectors", upstream.ID)
+		}
+
 		for _, connector := range upstream.Connectors {
 			if connector.URL == "" {
 				return nil, fmt.Errorf("upstream %s has empty connector URL", upstream.ID)
 			}
-			if seen[connector.URL] {
+			if seenURLs[connector.URL] {
 				return nil, fmt.Errorf("duplicate connector URL: %s", connector.URL)
 			}
-			seen[connector.URL] = true
+			seenURLs[connector.URL] = true
 		}
 	}
 
