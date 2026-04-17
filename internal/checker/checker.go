@@ -20,6 +20,8 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+const historicalBlockOffset uint64 = 10000
+
 type Options struct {
 	MaxBlockGap    uint64
 	BlockHashCount int
@@ -61,17 +63,19 @@ type NodeResult struct {
 	DebugOK            bool
 	Latency            time.Duration
 	TxCounts           *BlockTxCounts
+	HistoricalTxCounts *BlockTxCounts
 	Error              error
 }
 
 type ChainResult struct {
-	Chain             string
-	Nodes             []NodeResult
-	ExpectedChainID   *big.Int
-	MaxBlockNumber    uint64
-	CommonBlockNumber uint64
-	FailedNodes       []FailedNode
-	Passed            bool
+	Chain                 string
+	Nodes                 []NodeResult
+	ExpectedChainID       *big.Int
+	MaxBlockNumber        uint64
+	CommonBlockNumber     uint64
+	HistoricalBlockNumber uint64
+	FailedNodes           []FailedNode
+	Passed                bool
 }
 
 type CheckResult struct {
@@ -473,22 +477,22 @@ func (c *Checker) checkBlockTransactions(ctx context.Context, result *ChainResul
 		failedAddrs[fn.Address] = struct{}{}
 	}
 
-	passingIdx := make([]int, 0, len(result.Nodes))
 	var commonBlock uint64
-	for i, node := range result.Nodes {
+	hasPassing := false
+	for _, node := range result.Nodes {
 		if node.Error != nil {
 			continue
 		}
 		if _, ok := failedAddrs[node.Address]; ok {
 			continue
 		}
-		if len(passingIdx) == 0 || node.BlockNumber < commonBlock {
+		if !hasPassing || node.BlockNumber < commonBlock {
 			commonBlock = node.BlockNumber
+			hasPassing = true
 		}
-		passingIdx = append(passingIdx, i)
 	}
 
-	if len(passingIdx) == 0 {
+	if !hasPassing {
 		return
 	}
 	if commonBlock == 0 {
@@ -497,10 +501,42 @@ func (c *Checker) checkBlockTransactions(ctx context.Context, result *ChainResul
 	}
 
 	result.CommonBlockNumber = commonBlock
+	c.checkTxCountsAtBlock(ctx, result, commonBlock, failedAddrs,
+		func(idx int, counts *BlockTxCounts) { result.Nodes[idx].TxCounts = counts })
+
+	if commonBlock >= historicalBlockOffset {
+		historicalBlock := commonBlock - historicalBlockOffset
+		result.HistoricalBlockNumber = historicalBlock
+		c.checkTxCountsAtBlock(ctx, result, historicalBlock, failedAddrs,
+			func(idx int, counts *BlockTxCounts) { result.Nodes[idx].HistoricalTxCounts = counts })
+	}
+}
+
+func (c *Checker) checkTxCountsAtBlock(
+	ctx context.Context,
+	result *ChainResult,
+	block uint64,
+	failedAddrs map[string]struct{},
+	store func(idx int, counts *BlockTxCounts),
+) {
+	passingIdx := make([]int, 0, len(result.Nodes))
+	for i, node := range result.Nodes {
+		if node.Error != nil {
+			continue
+		}
+		if _, ok := failedAddrs[node.Address]; ok {
+			continue
+		}
+		passingIdx = append(passingIdx, i)
+	}
+
+	if len(passingIdx) == 0 {
+		return
+	}
+
+	counts := make([]*BlockTxCounts, len(result.Nodes))
 
 	var wg sync.WaitGroup
-	var mu sync.Mutex
-
 	for _, i := range passingIdx {
 		wg.Add(1)
 		go func(idx int) {
@@ -514,40 +550,40 @@ func (c *Checker) checkBlockTransactions(ctx context.Context, result *ChainResul
 				Chain:   result.Nodes[idx].Chain,
 				Address: result.Nodes[idx].Address,
 			}
-			counts := c.fetchBlockTxCounts(ctx, n, commonBlock)
-
-			mu.Lock()
-			result.Nodes[idx].TxCounts = counts
-			mu.Unlock()
+			counts[idx] = c.fetchBlockTxCounts(ctx, n, block)
 		}(i)
 	}
-
 	wg.Wait()
+
+	for _, i := range passingIdx {
+		store(i, counts[i])
+	}
 
 	// Per-node internal consistency check
 	for _, i := range passingIdx {
 		node := result.Nodes[i]
-		if node.TxCounts == nil {
+		tc := counts[i]
+		if tc == nil {
 			continue
 		}
-		if node.TxCounts.Err != nil {
+		if tc.Err != nil {
 			result.FailedNodes = append(result.FailedNodes, FailedNode{
 				ID:      node.ID,
 				Chain:   node.Chain,
 				Address: node.Address,
-				Reason:  fmt.Sprintf("failed to fetch tx counts at block %d: %v", commonBlock, node.TxCounts.Err),
+				Reason:  fmt.Sprintf("failed to fetch tx counts at block %d: %v", block, tc.Err),
 			})
 			result.Passed = false
 			failedAddrs[node.Address] = struct{}{}
 			continue
 		}
-		if node.TxCounts.Eth != node.TxCounts.Receipts || node.TxCounts.Eth != node.TxCounts.Debug {
+		if tc.Eth != tc.Receipts || tc.Eth != tc.Debug {
 			result.FailedNodes = append(result.FailedNodes, FailedNode{
 				ID:      node.ID,
 				Chain:   node.Chain,
 				Address: node.Address,
 				Reason: fmt.Sprintf("transaction count mismatch at block %d: eth=%d, receipts=%d, debug=%d",
-					commonBlock, node.TxCounts.Eth, node.TxCounts.Receipts, node.TxCounts.Debug),
+					block, tc.Eth, tc.Receipts, tc.Debug),
 			})
 			result.Passed = false
 			failedAddrs[node.Address] = struct{}{}
@@ -558,13 +594,14 @@ func (c *Checker) checkBlockTransactions(ctx context.Context, result *ChainResul
 	countNodes := make(map[int][]string)
 	for _, i := range passingIdx {
 		node := result.Nodes[i]
-		if node.TxCounts == nil || node.TxCounts.Err != nil {
+		tc := counts[i]
+		if tc == nil || tc.Err != nil {
 			continue
 		}
 		if _, ok := failedAddrs[node.Address]; ok {
 			continue
 		}
-		countNodes[node.TxCounts.Eth] = append(countNodes[node.TxCounts.Eth], node.ID)
+		countNodes[tc.Eth] = append(countNodes[tc.Eth], node.ID)
 	}
 
 	if len(countNodes) <= 1 {
@@ -597,9 +634,10 @@ func (c *Checker) checkBlockTransactions(ctx context.Context, result *ChainResul
 				ID:      nodeID,
 				Chain:   nodeChain,
 				Address: nodeAddr,
-				Reason:  fmt.Sprintf("transaction count mismatch at block %d: got %d, majority %d", commonBlock, count, majorityCount),
+				Reason:  fmt.Sprintf("transaction count mismatch at block %d: got %d, majority %d", block, count, majorityCount),
 			})
 			result.Passed = false
+			failedAddrs[nodeAddr] = struct{}{}
 		}
 	}
 }

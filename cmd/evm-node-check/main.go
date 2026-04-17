@@ -139,6 +139,9 @@ func printResults(logger *slog.Logger, result *checker.CheckResult) {
 		if chainResult.CommonBlockNumber != 0 {
 			chainAttrs = append(chainAttrs, "common_block", chainResult.CommonBlockNumber)
 		}
+		if chainResult.HistoricalBlockNumber != 0 {
+			chainAttrs = append(chainAttrs, "historical_block", chainResult.HistoricalBlockNumber)
+		}
 		logger.Info("chain results", chainAttrs...)
 
 		// Print successful nodes
@@ -178,6 +181,13 @@ func printResults(logger *slog.Logger, result *checker.CheckResult) {
 						"tx_count_eth", node.TxCounts.Eth,
 						"tx_count_receipts", node.TxCounts.Receipts,
 						"tx_count_debug", node.TxCounts.Debug,
+					)
+				}
+				if node.HistoricalTxCounts != nil && node.HistoricalTxCounts.Err == nil {
+					nodeAttrs = append(nodeAttrs,
+						"historical_tx_count_eth", node.HistoricalTxCounts.Eth,
+						"historical_tx_count_receipts", node.HistoricalTxCounts.Receipts,
+						"historical_tx_count_debug", node.HistoricalTxCounts.Debug,
 					)
 				}
 				logger.Info("node OK", nodeAttrs...)

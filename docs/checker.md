@@ -58,6 +58,8 @@ The element count of each response is then validated:
 - **Intra-node consistency** — all three counts must match. A mismatch signals a broken archive reindex, a partial snapshot, a desynced node-service database, or a misconfigured tracer.
 - **Cross-node consistency** — majority vote determines the canonical count; nodes in the minority are marked as failed. This catches hidden divergence in the transaction set that header-hash comparison alone would miss.
 
+Immediately after the check on the common block, the same procedure is repeated on the **historical block** — `commonBlock - 10000`. The exact block number is shared across all nodes, so it is the node-service that is being compared, not the chain offset. A node may be perfectly aligned at the head yet have damaged history: truncated receipts, a pruned range that should be archival, or a trace database out of sync with the execution state. The historical pass surfaces exactly that class of defect. It is skipped automatically when the common block is below 10000 (fresh testnets, local devnets). Nodes that failed on the head-block pass are not re-probed on the historical block.
+
 ### Stage 5. Block hash majority voting
 
 For each of the last N blocks, the checker builds a distribution of hashes across nodes. If everyone agrees, the block is skipped. If there is disagreement, the majority hash is picked, and nodes with minority hashes are marked as failed with the specific block that diverged.
@@ -83,6 +85,7 @@ The overall verdict: **PASSED** if every node in every chain passed; **FAILED** 
 | Debug API             | Node cannot be used for tracing                                                                     |
 | Tx count (internal)   | Desync between methods on the same node: broken receipts index, faulty tracer, inconsistent archive |
 | Tx count (cross-node) | Node silently diverging on the transaction set                                                      |
+| Tx count (historical) | Damaged history on a head-aligned node: pruned archive, desynced receipts/tracer at head-10000      |
 | Block hash majority   | Node stuck on a fork or stale branch after a reorg                                                  |
 
 ## Concurrency
