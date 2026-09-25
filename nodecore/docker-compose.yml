@@ -1,0 +1,31 @@
+# Project name is pinned so it does not default to the generic "nodecore" directory name.
+name: evm-node-check
+
+services:
+  nodecore:
+    image: drpcorg/nodecore:1.16.5
+    restart: unless-stopped
+    environment:
+      NODECORE_CONFIG_PATH: /app/nodecore.yml
+      LOG_LEVEL: ${NODECORE_LOG_LEVEL:-info}
+    volumes:
+      - ./nodecore.yml:/app/nodecore.yml:ro
+    ports:
+      - "9090:9090" # JSON-RPC: http://localhost:9090/queries/<chain>
+      - "9093:9093" # Prometheus metrics: /metrics
+      - "9096:9096" # health: /health, /ready, /status
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Cache/app storage for nodecore: use `redis://redis:6379/0` in nodecore.yml.
+  # Cache only, so no persistence.
+  redis:
+    image: redis:8.10.2-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15

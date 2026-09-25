@@ -1,0 +1,75 @@
+# nodecore config for local testing (docker compose). See
+# https://github.com/drpcorg/nodecore/tree/main/docs/nodecore for all options.
+server:
+  port: 9090
+  metrics-port: 9093
+  health-port: 9096
+
+upstream-config:
+  # strict: every validator runs (chain id, syncing, peers, lag, ...), so the
+  # per-upstream availability status reflects real node health.
+  mode: strict
+  upstreams:
+    # Ethereum testnet (11155111)
+    - id: eth-testnet-1
+      chain: sepolia
+      connectors:
+        - type: json-rpc
+          url: http://sepolia-node-1.example.com:8545
+    - id: eth-testnet-2
+      chain: sepolia
+      connectors:
+        - type: json-rpc
+          url: http://sepolia-node-2.example.com:8545
+
+    # BSC testnet (97)
+    - id: bsc-testnet-1
+      chain: bsc-testnet
+      connectors:
+        - type: json-rpc
+          url: http://bsc-testnet-node-1.example.com:8545
+    - id: bsc-testnet-2
+      chain: bsc-testnet
+      connectors:
+        - type: json-rpc
+          url: http://bsc-testnet-node-2.example.com:8545
+
+    # Polygon testnet (80002)
+    - id: polygon-testnet-1
+      chain: polygon-amoy
+      connectors:
+        - type: json-rpc
+          url: http://polygon-amoy-node-1.example.com:8545
+
+    # TON (TON Center). Split mode: one upstream per API version, as recommended
+    # by nodecore — v2 (`rest`, URL with /api/v2) and v3 indexer (`rest-indexer`,
+    # no path prefix). Chains: `ton` (mainnet) and `ton-testnet`.
+    # TON Center keys are per network: a mainnet key is rejected on testnet.
+    - id: ton-mainnet-1-v2
+      chain: ton
+      connectors:
+        - type: rest
+          url: https://toncenter.com/api/v2
+          headers:
+            X-API-Key: "your-mainnet-api-key"
+    - id: ton-mainnet-1-v3
+      chain: ton
+      connectors:
+        - type: rest-indexer
+          url: https://toncenter.com
+          headers:
+            X-API-Key: "your-mainnet-api-key"
+    - id: ton-testnet-1-v2
+      chain: ton-testnet
+      connectors:
+        - type: rest
+          url: https://testnet.toncenter.com/api/v2
+          headers:
+            X-API-Key: "your-testnet-api-key"
+    - id: ton-testnet-1-v3
+      chain: ton-testnet
+      connectors:
+        - type: rest-indexer
+          url: https://testnet.toncenter.com
+          headers:
+            X-API-Key: "your-testnet-api-key"

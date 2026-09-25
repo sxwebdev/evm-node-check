@@ -1,0 +1,19 @@
+# TON Center API keys to validate. Copy to ton.yaml (git-ignored) and fill in.
+# Keys are issued per network by @tonapibot: a mainnet key is rejected on
+# testnet and vice versa.
+
+# Optional: override TON Center base URLs (e.g. a self-hosted instance).
+# endpoints:
+#   mainnet: https://toncenter.com
+#   testnet: https://testnet.toncenter.com
+
+keys:
+  - name: backend-prod
+    network: mainnet
+    key: "your-mainnet-api-key"
+  - name: backend-dev
+    network: testnet
+    key: "your-testnet-api-key"
+  # Omit network to detect it automatically.
+  - name: unknown-origin
+    key: "some-api-key"

@@ -32,7 +32,11 @@ go.work.sum
 .vscode/
 .claude/
 
-# Config file
+# Config files
 config.yaml
+evm.yaml
+ton.yaml
+nodecore/nodecore.yml
+nodecore/docker-compose.override.yml
 
 /evm-node-check

@@ -5,28 +5,28 @@ upstream-config:
       chain: sepolia
       connectors:
         - type: json-rpc
-          url: http://65.108.12.169:8545
+          url: http://sepolia-node-1.example.com:8545
     - id: eth-testnet-2
       chain: sepolia
       connectors:
         - type: json-rpc
-          url: http://51.195.60.61:8545
+          url: http://sepolia-node-2.example.com:8545
 
     # BSC testnet (97)
     - id: bsc-testnet-1
       chain: bsc-testnet
       connectors:
         - type: json-rpc
-          url: http://144.76.115.142:8545
+          url: http://bsc-testnet-node-1.example.com:8545
     - id: bsc-testnet-2
       chain: bsc-testnet
       connectors:
         - type: json-rpc
-          url: http://148.113.20.184:8545
+          url: http://bsc-testnet-node-2.example.com:8545
 
     # Polygon testnet (80002)
     - id: polygon-testnet-1
       chain: polygon-amoy
       connectors:
         - type: json-rpc
-          url: http://157.90.68.155:8545
+          url: http://polygon-amoy-node-1.example.com:8545
