@@ -3,7 +3,7 @@ name: evm-node-check
 
 services:
   nodecore:
-    image: drpcorg/nodecore:1.16.5
+    image: drpcorg/nodecore:1.16.12
     restart: unless-stopped
     environment:
       NODECORE_CONFIG_PATH: /app/nodecore.yml
