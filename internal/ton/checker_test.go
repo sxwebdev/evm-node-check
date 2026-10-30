@@ -1,10 +1,12 @@
 package ton_test
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -545,5 +547,167 @@ func TestCheckTransportErrors(t *testing.T) {
 			}
 			assertReason(t, got, []string{tt.wantReason})
 		})
+	}
+}
+
+func rateOptions() ton.Options {
+	opts := testOptions()
+	opts.MinRPS = 40
+	opts.RateProbeDuration = 500 * time.Millisecond
+	opts.RateProbeCooldown = time.Millisecond
+	return opts
+}
+
+func TestCheckRateProbe(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		rps          int
+		wantPassed   bool
+		wantLow      bool
+		wantAccepted func(int) bool
+		wantReason   []string
+	}{
+		{
+			name:         "paid plan sustains the rate",
+			wantPassed:   true,
+			wantAccepted: func(n int) bool { return n == 20 },
+		},
+		{
+			name:    "free plan is flagged",
+			rps:     5,
+			wantLow: true,
+			// The probe spans at most two one-second windows.
+			wantAccepted: func(n int) bool { return n <= 10 },
+			wantReason:   []string{"rate limit below 40 rps", "/20 requests accepted", "free plan"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			mainnet := newFakeNet(mainnetID, mainKey)
+			mainnet.rps = tt.rps
+
+			got := checkOne(t, mainnet, newFakeNet(testnetID), rateOptions(), ton.Key{Name: "k", Network: ton.Mainnet, Key: mainKey})
+
+			if got.Passed != tt.wantPassed || got.LowRateLimit != tt.wantLow {
+				t.Errorf("Passed/LowRateLimit = %v/%v, want %v/%v (reason: %s)",
+					got.Passed, got.LowRateLimit, tt.wantPassed, tt.wantLow, got.Reason)
+			}
+			if got.Status != ton.StatusValid {
+				t.Errorf("Status = %q, want %q", got.Status, ton.StatusValid)
+			}
+			if got.ProbeSent != 20 || !tt.wantAccepted(got.ProbeAccepted) {
+				t.Errorf("probe accepted/sent = %d/%d, unexpected", got.ProbeAccepted, got.ProbeSent)
+			}
+			if want := float64(got.ProbeAccepted) / 0.5; got.AcceptedRPS != want {
+				t.Errorf("AcceptedRPS = %v, want %v", got.AcceptedRPS, want)
+			}
+			assertReason(t, got, tt.wantReason)
+		})
+	}
+}
+
+func TestCheckRateProbeSkipped(t *testing.T) {
+	t.Parallel()
+
+	t.Run("disabled", func(t *testing.T) {
+		t.Parallel()
+		mainnet := newFakeNet(mainnetID, mainKey)
+		opts := rateOptions()
+		opts.MinRPS = 0
+
+		got := checkOne(t, mainnet, newFakeNet(testnetID), opts, ton.Key{Name: "k", Network: ton.Mainnet, Key: mainKey})
+
+		if !got.Passed || got.ProbeSent != 0 {
+			t.Errorf("Passed/ProbeSent = %v/%d, want true/0 (reason: %s)", got.Passed, got.ProbeSent, got.Reason)
+		}
+		if n := mainnet.requests.Load(); n != 3 {
+			t.Errorf("mainnet requests = %d, want 3", n)
+		}
+	})
+
+	t.Run("invalid key", func(t *testing.T) {
+		t.Parallel()
+		mainnet := newFakeNet(mainnetID, mainKey)
+		testnet := newFakeNet(testnetID, testKey)
+
+		got := checkOne(t, mainnet, testnet, rateOptions(), ton.Key{Name: "k", Network: ton.Mainnet, Key: badKey})
+
+		if got.ProbeSent != 0 || got.LowRateLimit {
+			t.Errorf("ProbeSent/LowRateLimit = %d/%v, want 0/false", got.ProbeSent, got.LowRateLimit)
+		}
+		if n := mainnet.requests.Load() + testnet.requests.Load(); n != 2 {
+			t.Errorf("requests = %d, want 2", n)
+		}
+	})
+}
+
+func TestCheckRateProbeErrors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("server error during probe", func(t *testing.T) {
+		t.Parallel()
+		mainnet := newFakeNet(mainnetID, mainKey)
+		var calls atomic.Int32
+		mainnet.override["/api/v2/getMasterchainInfo"] = func(w http.ResponseWriter, _ *http.Request) {
+			// The first call is the key check, the rest are the probe.
+			if calls.Add(1) > 1 {
+				w.WriteHeader(http.StatusBadGateway)
+				fmt.Fprint(w, `{"ok":false,"error":"LITE_SERVER_UNKNOWN","code":502}`)
+				return
+			}
+			fmt.Fprintf(w, `{"ok":true,"result":{"last":{"workchain":-1,"shard":%q,"seqno":%d}}}`, masterShard, mainnet.v2Seqno)
+		}
+
+		got := checkOne(t, mainnet, newFakeNet(testnetID), rateOptions(), ton.Key{Name: "k", Network: ton.Mainnet, Key: mainKey})
+
+		if got.Passed || got.LowRateLimit {
+			t.Errorf("Passed/LowRateLimit = %v/%v, want false/false", got.Passed, got.LowRateLimit)
+		}
+		assertReason(t, got, []string{"rate probe: HTTP 502: LITE_SERVER_UNKNOWN"})
+	})
+
+	t.Run("context canceled", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithCancel(t.Context())
+		mainnet := newFakeNet(mainnetID, mainKey)
+		mainnet.override["/api/v3/masterchainInfo"] = func(w http.ResponseWriter, _ *http.Request) {
+			// Cancel once the key check is done, before the probe starts.
+			cancel()
+			fmt.Fprintf(w, `{"last":{"seqno":%d,"global_id":%d,"gen_utime":"%d"}}`, mainnet.v3Seqno, mainnet.globalID, mainnet.blockTime.Unix())
+		}
+		opts := rateOptions()
+		opts.RateProbeCooldown = time.Hour
+
+		result := newChecker(t, mainnet, newFakeNet(testnetID), opts, ton.Key{Name: "k", Network: ton.Mainnet, Key: mainKey}).Check(ctx)
+
+		got := result.Keys[0]
+		if got.Passed || result.Passed {
+			t.Errorf("Passed = %v/%v, want false", got.Passed, result.Passed)
+		}
+		assertReason(t, got, []string{"rate probe: context canceled"})
+	})
+}
+
+func TestCheckRateProbeSequential(t *testing.T) {
+	t.Parallel()
+	// Two keys of one account share the limit: probed concurrently, both
+	// would see half of it.
+	const otherKey = "mainnet-key-0000000000000000000000000000000000000000000000000004"
+	mainnet := newFakeNet(mainnetID, mainKey, otherKey)
+	opts := rateOptions()
+	opts.RateProbeCooldown = time.Second // let the one-second window reset
+	mainnet.rps = 25
+
+	result := newChecker(t, mainnet, newFakeNet(testnetID), opts,
+		ton.Key{Name: "a", Network: ton.Mainnet, Key: mainKey},
+		ton.Key{Name: "b", Network: ton.Mainnet, Key: otherKey},
+	).Check(t.Context())
+
+	if !result.Passed {
+		t.Errorf("CheckResult.Passed = false, want true: %+v", result.Keys)
 	}
 }

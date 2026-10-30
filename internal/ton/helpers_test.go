@@ -27,8 +27,13 @@ type fakeNet struct {
 	// override replaces the default handler for a path.
 	override map[string]http.HandlerFunc
 
+	// rps limits accepted requests per fixed one-second window (0 = no limit).
+	rps int
+
 	mu          sync.Mutex
 	rateLimited int // number of upcoming requests to answer with 429
+	window      time.Time
+	inWindow    int
 
 	requests atomic.Int32
 }
@@ -68,6 +73,13 @@ func (f *fakeNet) serve(w http.ResponseWriter, r *http.Request) {
 	limited := f.rateLimited > 0
 	if limited {
 		f.rateLimited--
+	}
+	if f.rps > 0 && !limited {
+		if now := time.Now(); now.Sub(f.window) >= time.Second {
+			f.window, f.inWindow = now, 0
+		}
+		f.inWindow++
+		limited = f.inWindow > f.rps
 	}
 	f.mu.Unlock()
 	if limited {

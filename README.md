@@ -133,20 +133,22 @@ keys:
   - name: backend-prod
     network: mainnet
     key: "..."
-  - name: unknown-origin          # network omitted: detected automatically
+  - name: unknown-origin # network omitted: detected automatically
     key: "..."
 ```
 
 ### Flags
 
-| Flag              | Short | Default  | Description                                                   |
-| ----------------- | ----- | -------- | ------------------------------------------------------------- |
-| `--config`        | `-c`  | required | Path to YAML config file with keys                            |
-| `--timeout`       | `-t`  | 15       | Timeout in seconds for each key check (including retries)     |
-| `--max-block-age` |       | 60       | Maximum age in seconds of the last masterchain block (0 = off) |
-| `--max-seqno-gap` |       | 10       | Maximum masterchain seqno gap between API v2 and v3           |
-| `--max-retries`   |       | 3        | Retries on HTTP 429 per request                               |
-| `--verbose`       | `-v`  | false    | Enable verbose output                                         |
+| Flag                    | Short | Default  | Description                                                                                 |
+| ----------------------- | ----- | -------- | ------------------------------------------------------------------------------------------- |
+| `--config`              | `-c`  | required | Path to YAML config file with keys                                                          |
+| `--timeout`             | `-t`  | 15       | Timeout in seconds for each key check (including retries)                                   |
+| `--max-block-age`       |       | 60       | Maximum age in seconds of the last masterchain block (0 = off)                              |
+| `--max-seqno-gap`       |       | 10       | Maximum masterchain seqno gap between API v2 and v3                                         |
+| `--max-retries`         |       | 3        | Retries on HTTP 429 per request                                                             |
+| `--min-rps`             |       | 30       | Request rate each key must sustain (0 = off), see [Rate limit](#rate-limit-valid-keys-only) |
+| `--rate-probe-duration` |       | 2        | Duration in seconds of the rate probe of each key                                           |
+| `--verbose`             | `-v`  | false    | Enable verbose output                                                                       |
 
 ### Key status
 
@@ -165,7 +167,13 @@ TON Center issues keys per network. If a key is rejected on its declared network
 - Last masterchain block is fresh, for both API v2 (`getBlockHeader`) and v3 (`masterchainInfo`)
 - Masterchain seqno of API v2 and v3 differ by at most `--max-seqno-gap`
 
-Exit code is `1` if any key is not valid or fails a health check.
+### Rate limit (valid keys only)
+
+TON Center does not report the plan of a key (the free plan allows 10 rps, paid ones 25–100 rps), so it is measured: `getMasterchainInfo` is sent at `--min-rps` for `--rate-probe-duration` seconds without retries, and at least 90% of the requests must be accepted. Otherwise the key fails with `rate limit below 30 rps: 20/60 requests accepted (~10.0 rps), account is likely on the free plan`, and the summary lists such keys.
+
+Limits are shared by all keys of an account on a network, so the probes run one key at a time with a 1-second pause before each. Traffic of other clients of the same account during the check lowers the result, and the probe itself takes `--min-rps` out of the account's limit for its duration.
+
+Exit code is `1` if any key is not valid, fails a health check or has a low rate limit.
 
 ## Local nodecore
 
@@ -189,12 +197,12 @@ make nodecore-check
 evm-node-check nodecore -c nodecore/nodecore.yml --metrics-url http://localhost:9093/metrics
 ```
 
-| Flag            | Short | Default                         | Description                                         |
-| --------------- | ----- | ------------------------------- | --------------------------------------------------- |
-| `--config`      | `-c`  | required                        | Path to the nodecore config                         |
+| Flag            | Short | Default                         | Description                                          |
+| --------------- | ----- | ------------------------------- | ---------------------------------------------------- |
+| `--config`      | `-c`  | required                        | Path to the nodecore config                          |
 | `--metrics-url` | `-m`  | `http://localhost:9093/metrics` | nodecore Prometheus endpoint (`server.metrics-port`) |
 | `--wait`        | `-w`  | 60                              | Seconds after nodecore start to let upstreams settle |
-| `--verbose`     | `-v`  | false                           | Enable verbose output                               |
+| `--verbose`     | `-v`  | false                           | Enable verbose output                                |
 
 The verdict is nodecore's own (`nodecore_upstream_availability_status`, produced by its validators — use `mode: strict` to run all of them): `available`, `immature`, `syncing`, `unavailable`. nodecore does not report an upstream that never passed its initial validation (unreachable node, wrong chain, invalid API key), and `/status` only shows per-chain state, so the config is compared against the metrics and such upstreams are reported as `missing` — the cause is in `make nodecore-logs`.
 

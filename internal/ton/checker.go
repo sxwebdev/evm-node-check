@@ -27,6 +27,16 @@ type Options struct {
 	MaxRetries int
 	// RetryDelay is the pause between retries on HTTP 429.
 	RetryDelay time.Duration
+	// MinRPS is the request rate a key must sustain (0 to disable). TON Center
+	// does not expose the plan of a key, so the rate is probed: requests are
+	// sent at MinRPS for RateProbeDuration and nearly all must be accepted.
+	// The free plan allows 10 rps, paid ones 25 rps and more.
+	MinRPS int
+	// RateProbeDuration is how long the rate probe sends requests.
+	RateProbeDuration time.Duration
+	// RateProbeCooldown is the pause before each rate probe, so that earlier
+	// requests do not count against the probe.
+	RateProbeCooldown time.Duration
 }
 
 func DefaultOptions() Options {
@@ -36,6 +46,10 @@ func DefaultOptions() Options {
 		MaxSeqnoGap: 10,
 		MaxRetries:  3,
 		RetryDelay:  time.Second,
+
+		MinRPS:            30,
+		RateProbeDuration: 2 * time.Second,
+		RateProbeCooldown: time.Second,
 	}
 }
 
@@ -83,8 +97,17 @@ type KeyResult struct {
 	V2BlockTime     time.Time
 	V3Seqno         uint32
 	V3BlockTime     time.Time
-	Reason          string
-	Passed          bool
+	// ProbeSent and ProbeAccepted are the rate probe counters (zero if the
+	// probe did not run).
+	ProbeSent     int
+	ProbeAccepted int
+	// AcceptedRPS is the rate TON Center accepted during the rate probe.
+	AcceptedRPS float64
+	// LowRateLimit means the key could not sustain MinRPS, which usually
+	// means its account is on the free plan.
+	LowRateLimit bool
+	Reason       string
+	Passed       bool
 }
 
 type CheckResult struct {
@@ -121,6 +144,16 @@ func (c *Checker) Check(ctx context.Context) *CheckResult {
 		})
 	}
 	wg.Wait()
+
+	// Rate limits are shared by all keys of an account on a network, so the
+	// probes run one at a time to not interfere with each other.
+	if c.opts.MinRPS > 0 {
+		for i := range result.Keys {
+			if result.Keys[i].Status == StatusValid {
+				c.checkRate(ctx, c.cfg.Keys[i].Key, &result.Keys[i])
+			}
+		}
+	}
 
 	for _, k := range result.Keys {
 		if !k.Passed {
@@ -248,6 +281,96 @@ func (c *Checker) checkBlock(api string, n Network, globalID int32, blockTime ti
 	return problems
 }
 
+// checkRate probes the rate limit of a valid key and records a problem if the
+// key cannot sustain MinRPS.
+func (c *Checker) checkRate(ctx context.Context, key string, res *KeyResult) {
+	select {
+	case <-ctx.Done():
+		res.addProblem(fmt.Sprintf("rate probe: %v", ctx.Err()))
+		return
+	case <-time.After(c.opts.RateProbeCooldown):
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, c.opts.RateProbeDuration+c.opts.Timeout)
+	defer cancel()
+
+	sent, accepted, err := c.probeRate(ctx, res.DetectedNetwork, key)
+	res.ProbeSent, res.ProbeAccepted = sent, accepted
+	res.AcceptedRPS = float64(accepted) / c.opts.RateProbeDuration.Seconds()
+	if err != nil {
+		res.addProblem(fmt.Sprintf("rate probe: %v", err))
+		return
+	}
+	// Allow a few rejections caused by network jitter.
+	if accepted*10 < sent*9 {
+		res.LowRateLimit = true
+		res.addProblem(fmt.Sprintf("rate limit below %d rps: %d/%d requests accepted (~%.1f rps), account is likely on the free plan",
+			c.opts.MinRPS, accepted, sent, res.AcceptedRPS))
+	}
+}
+
+// probeRate sends getMasterchainInfo at MinRPS for RateProbeDuration without
+// retrying on HTTP 429, and returns how many requests were sent and accepted.
+func (c *Checker) probeRate(ctx context.Context, n Network, key string) (sent, accepted int, err error) {
+	total := max(1, int(float64(c.opts.MinRPS)*c.opts.RateProbeDuration.Seconds()))
+	ticker := time.NewTicker(time.Second / time.Duration(c.opts.MinRPS))
+	defer ticker.Stop()
+
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		firstErr error
+	)
+	record := func(ok bool, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if ok {
+			accepted++
+		}
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	for sent < total {
+		if sent > 0 {
+			select {
+			case <-ctx.Done():
+			case <-ticker.C:
+			}
+			if err := ctx.Err(); err != nil {
+				record(false, err)
+				break
+			}
+		}
+		sent++
+		wg.Go(func() {
+			status, body, err := c.do(ctx, n, key, "/api/v2/getMasterchainInfo", nil)
+			switch {
+			case err != nil:
+				record(false, err)
+			case status == http.StatusOK:
+				record(true, nil)
+			case status == http.StatusTooManyRequests:
+				record(false, nil)
+			default:
+				record(false, fmt.Errorf("HTTP %d: %s", status, errorMessage(body)))
+			}
+		})
+	}
+	wg.Wait()
+
+	return sent, accepted, firstErr
+}
+
+func (r *KeyResult) addProblem(problem string) {
+	if r.Reason != "" {
+		r.Reason += "; "
+	}
+	r.Reason += problem
+	r.Passed = false
+}
+
 // MaskKey hides the middle of an API key so it can be logged safely.
 func MaskKey(key string) string {
 	if len(key) <= 12 {
@@ -326,29 +449,13 @@ func v2Get[T any](ctx context.Context, c *Checker, n Network, key, method string
 // JSON body into out. The key is always sent: TON Center serves anonymous
 // requests on mainnet, so omitting it would make any key look valid.
 func (c *Checker) get(ctx context.Context, n Network, key, path string, query url.Values, out any) error {
-	u := c.cfg.Endpoints.URL(n) + path
-	if len(query) > 0 {
-		u += "?" + query.Encode()
-	}
-
 	for attempt := 0; ; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		status, body, err := c.do(ctx, n, key, path, query)
 		if err != nil {
-			return fmt.Errorf("failed to build request: %w", err)
-		}
-		req.Header.Set("X-API-Key", key)
-
-		resp, err := c.client.Do(req)
-		if err != nil {
-			return fmt.Errorf("request failed: %w", err)
-		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		resp.Body.Close()
-		if err != nil {
-			return fmt.Errorf("failed to read response: %w", err)
+			return err
 		}
 
-		switch resp.StatusCode {
+		switch status {
 		case http.StatusOK:
 			if err := json.Unmarshal(body, out); err != nil {
 				return fmt.Errorf("failed to decode response: %w", err)
@@ -367,9 +474,35 @@ func (c *Checker) get(ctx context.Context, n Network, key, path string, query ur
 			case <-time.After(c.opts.RetryDelay):
 			}
 		default:
-			return fmt.Errorf("HTTP %d: %s", resp.StatusCode, errorMessage(body))
+			return fmt.Errorf("HTTP %d: %s", status, errorMessage(body))
 		}
 	}
+}
+
+// do performs a single authenticated GET and returns the status and body.
+func (c *Checker) do(ctx context.Context, n Network, key, path string, query url.Values) (int, []byte, error) {
+	u := c.cfg.Endpoints.URL(n) + path
+	if len(query) > 0 {
+		u += "?" + query.Encode()
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("X-API-Key", key)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to read response: %w", err)
+	}
+	return resp.StatusCode, body, nil
 }
 
 // errorMessage extracts the "error" field of a TON Center error body, falling

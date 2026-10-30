@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/sxwebdev/evm-node-check/internal/ton"
@@ -40,6 +41,16 @@ func tonFlags() []cli.Flag {
 			Usage: "Number of retries on HTTP 429 per request",
 			Value: defaults.MaxRetries,
 		},
+		&cli.IntFlag{
+			Name:  "min-rps",
+			Usage: "Request rate each key must sustain, probed by sending requests at this rate (0 to disable; free plan allows 10 rps)",
+			Value: defaults.MinRPS,
+		},
+		&cli.IntFlag{
+			Name:  "rate-probe-duration",
+			Usage: "Duration in seconds of the rate probe of each key",
+			Value: int(defaults.RateProbeDuration / time.Second),
+		},
 		&cli.BoolFlag{
 			Name:    "verbose",
 			Aliases: []string{"v"},
@@ -68,6 +79,11 @@ func runTON(ctx context.Context, cmd *cli.Command) error {
 	opts.MaxBlockAge = time.Duration(cmd.Int("max-block-age")) * time.Second
 	opts.MaxSeqnoGap = uint32(cmd.Int("max-seqno-gap"))
 	opts.MaxRetries = int(cmd.Int("max-retries"))
+	opts.MinRPS = int(cmd.Int("min-rps"))
+	opts.RateProbeDuration = time.Duration(cmd.Int("rate-probe-duration")) * time.Second
+	if opts.MinRPS < 0 || (opts.MinRPS > 0 && opts.RateProbeDuration <= 0) {
+		return fmt.Errorf("--min-rps must be >= 0 and --rate-probe-duration must be > 0")
+	}
 
 	result := ton.New(cfg, opts, logger).Check(ctx)
 
@@ -83,6 +99,7 @@ func runTON(ctx context.Context, cmd *cli.Command) error {
 
 func printTONResults(logger *slog.Logger, result *ton.CheckResult) {
 	valid := 0
+	var lowRate []string
 	for _, k := range result.Keys {
 		if k.Status == ton.StatusValid {
 			valid++
@@ -117,6 +134,14 @@ func printTONResults(logger *slog.Logger, result *ton.CheckResult) {
 			attrs = append(attrs, "v3_block_age", time.Since(k.V3BlockTime).Truncate(time.Second))
 		}
 
+		if k.ProbeSent != 0 {
+			attrs = append(attrs, "accepted_rps", fmt.Sprintf("%.1f", k.AcceptedRPS),
+				"probe", fmt.Sprintf("%d/%d", k.ProbeAccepted, k.ProbeSent))
+		}
+		if k.LowRateLimit {
+			lowRate = append(lowRate, k.Name)
+		}
+
 		if k.Passed {
 			logger.Info("key OK", attrs...)
 		} else {
@@ -125,4 +150,7 @@ func printTONResults(logger *slog.Logger, result *ton.CheckResult) {
 	}
 
 	logger.Info("summary", "total_keys", len(result.Keys), "valid_keys", valid)
+	if len(lowRate) > 0 {
+		logger.Warn("keys with low rate limit, their accounts are likely on the free plan", "keys", strings.Join(lowRate, ", "))
+	}
 }
